@@ -1,0 +1,4 @@
+.stack-work/
+haskell-fwpl.cabal
+*~
+docker-compose.override.yml

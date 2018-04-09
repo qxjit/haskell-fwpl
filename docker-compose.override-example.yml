@@ -1,0 +1,8 @@
+version: "3"
+services:
+  haskell:
+    volumes:
+      - <my-stack-root-volume>:/stack-root
+volumes:
+  <my-stack-root-volume>:
+    external: true
