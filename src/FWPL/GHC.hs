@@ -10,12 +10,16 @@ import qualified Data.Dynamic as Dynamic
 import Data.Maybe (catMaybes, mapMaybe)
 import qualified Digraph as Digraph
 import Exception (gtry, gcatch)
+
+import qualified Annotations as Ann
 import qualified ErrUtils as ErrUtils
 import qualified HscTypes as HSC
 import GHC (Ghc)
 import qualified GHC as GHC
 import qualified GHC.Paths as Paths
+import qualified OccName as OccName
 import qualified Outputable as Out
+import qualified RdrName as RdrName
 import qualified Var as Var
 
 import FWPL.Model (Model, Module(..), Value(..))
@@ -74,12 +78,12 @@ loadModule summary = do
   parsed <- GHC.parseModule summary
   checked <- GHC.typecheckModule parsed
   loaded <- GHC.loadModule checked
+  names <- moduleTopLevelVarNames summary
 
-  let ids = moduleIds loaded
-      moduleImport = GHC.moduleName (GHC.ms_mod summary)
+  let moduleImport = GHC.moduleName (GHC.ms_mod summary)
 
   GHC.setContext [GHC.IIDecl prelude, GHC.IIModule moduleImport]
-  values <- mapM loadValue ids
+  values <- mapM loadValue names
   GHC.setContext []
 
   pure $
@@ -108,34 +112,42 @@ moduleNameString =
   GHC.moduleNameString . GHC.moduleName . GHC.ms_mod
 
 
-moduleIds :: GHC.TypecheckedModule -> [GHC.Id]
-moduleIds =
-  mapMaybe justId . GHC.modInfoTyThings . GHC.moduleInfo
-    where
-      justId (GHC.AnId id) = Just id
-      justId _ = Nothing
+moduleTopLevelVarNames :: GHC.ModSummary -> Ghc [GHC.Name]
+moduleTopLevelVarNames summary = do
+  info <- GHC.getModuleInfo (GHC.ms_mod summary)
 
-loadValue :: GHC.Id -> Ghc (Maybe Value)
-loadValue valueId = do
+  let crash thing = error ("Failed to load " ++ thing ++ " for " ++ moduleNameString summary)
+      iface = maybe (crash "ModuleInfo") GHC.modInfoIface info
+      globals = maybe (crash "ModIFace") GHC.mi_globals iface
+      gres = maybe (crash "globals") RdrName.globalRdrEnvElts globals
+      isLocalVar gre = RdrName.isLocalGRE gre &&
+                       OccName.isVarOcc (RdrName.greOccName gre)
+
+  pure (map RdrName.gre_name (filter isLocalVar gres))
+
+
+loadValue :: GHC.Name -> Ghc (Maybe Value)
+loadValue name = do
   dynFlags <- GHC.getSessionDynFlags
 
-  let nameString = Out.showPpr dynFlags valueId
+  let nameString = Out.showPpr dynFlags name
 
   -- It would be nice to use HsSyn (or similar) to construct this expression
   -- in a way guaranteed to parse, but for now we take this shortcut.
   result <- gtry (GHC.dynCompileExpr ("FWPL_QXJIT_PRELUDE.show " ++ nameString))
 
-  pure $
-    case result of
-      Left (err :: HSC.SourceError) ->
-        Nothing
+  case result of
+    Left (err :: HSC.SourceError) ->
+      pure Nothing
 
-      Right dyn ->
-        Just $ Value
-          { valueType = Out.showPpr dynFlags (GHC.idType valueId)
-          , valueName = nameString
-          , valueEval = Dynamic.fromDyn dyn "<FWPL INTERNAL ERROR: Show result was not a String>"
-          }
+    Right dyn -> do
+      typ <- GHC.exprType GHC.TM_Inst nameString
+
+      pure $ Just $ Value
+        { valueType = Out.showPpr dynFlags typ
+        , valueName = nameString
+        , valueEval = Dynamic.fromDyn dyn "<FWPL INTERNAL ERROR: Show result was not a String>"
+        }
 
 fileTarget :: FilePath -> GHC.Target
 fileTarget filePath =
