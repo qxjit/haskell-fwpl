@@ -2,3 +2,4 @@
 haskell-fwpl.cabal
 *~
 docker-compose.override.yml
+sandbox
