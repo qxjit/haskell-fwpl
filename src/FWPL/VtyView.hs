@@ -4,7 +4,7 @@ module FWPL.VtyView
 
 import qualified Graphics.Vty as Vty
 
-import FWPL.Model (Model, Module(..), Value(..))
+import FWPL.Model (Model, Module(..), Value(..), Eval(..))
 
 keywordAttr :: Vty.Attr
 keywordAttr =
@@ -25,6 +25,10 @@ funNameTypeSigAttr =
 errorAttr :: Vty.Attr
 errorAttr =
   Vty.defAttr `Vty.withForeColor` Vty.red
+
+outputLeaderAttr :: Vty.Attr
+outputLeaderAttr =
+  Vty.defAttr `Vty.withForeColor` Vty.green
 
 render :: Model -> Vty.Picture
 render model =
@@ -82,10 +86,28 @@ renderType value =
 
 renderEval :: Value -> Vty.Image
 renderEval value =
+  case valueEval value of
+    Right eval ->
+      Vty.vertCat
+        [ Vty.horizCat
+            [ Vty.string Vty.defAttr (valueName value)
+            , Vty.string keywordAttr " = "
+            , Vty.string Vty.defAttr (evalResult eval)
+            ]
+        , Vty.translateX
+            2
+            (Vty.vertCat
+              (map renderOutputLine (lines (evalOutput eval))))
+        ]
+
+    Left err ->
+      Vty.string errorAttr err
+
+renderOutputLine :: String -> Vty.Image
+renderOutputLine line =
   Vty.horizCat
-    [ Vty.string Vty.defAttr (valueName value)
-    , Vty.string keywordAttr " = "
-    , Vty.string Vty.defAttr (valueEval value)
+    [ Vty.string outputLeaderAttr "> "
+    , Vty.string Vty.defAttr line
     ]
 
 padBottom :: Vty.Image -> Vty.Image

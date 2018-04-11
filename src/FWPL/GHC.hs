@@ -1,4 +1,3 @@
-{-# LANGUAGE ScopedTypeVariables #-}
 module FWPL.GHC
   ( load
   , run
@@ -6,12 +5,15 @@ module FWPL.GHC
   ) where
 
 import Control.Exception (SomeException)
+import Control.Monad.IO.Class (liftIO)
 import Data.Data (Data)
 import qualified Data.Dynamic as Dynamic
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Typeable (Typeable)
 import qualified Digraph as Digraph
 import Exception (gtry, gcatch)
+
+import qualified System.IO.Silently as Silently
 
 import qualified Annotations as Ann
 import qualified ErrUtils as ErrUtils
@@ -26,7 +28,7 @@ import qualified Outputable as Out
 import qualified RdrName as RdrName
 import qualified Var as Var
 
-import FWPL.Model (Model, Module(..), Value(..))
+import FWPL.Model (Model, Module(..), Value(..), Eval(..))
 
 {- Type alias to make switching between Hint and GHC more convenient -}
 type Interpreter = Ghc
@@ -86,7 +88,13 @@ loadModule summary = do
 
   let moduleImport = GHC.moduleName (GHC.ms_mod summary)
 
-  GHC.setContext [GHC.IIDecl prelude, GHC.IIModule moduleImport]
+  GHC.setContext
+    [ GHC.IIDecl preludeImport
+    , GHC.IIDecl ioImport
+    , GHC.IIDecl applicativeImport
+    , GHC.IIModule moduleImport
+    ]
+
   values <- mapM loadValue introspections
   GHC.setContext []
 
@@ -115,8 +123,9 @@ moduleNameString :: GHC.ModSummary -> String
 moduleNameString =
   GHC.moduleNameString . GHC.moduleName . GHC.ms_mod
 
-data Introspection =
-  Show OccName.OccName
+data Introspection
+  = Show OccName.OccName
+  | Run OccName.OccName
 
 
 moduleIntrospections :: GHC.ModSummary -> Ghc [Introspection]
@@ -138,6 +147,7 @@ introspectionForAnnotation ann =
     Ann.NamedTarget occName ->
       case deserializeAnnotationPayload (IfaceSyn.ifAnnotatedValue ann) of
         Just "fwpl:show" -> Just (Show occName)
+        Just "fwpl:run" -> Just (Run occName)
         _ -> Nothing
 
 deserializeAnnotationPayload :: (Data a, Typeable a) => Plugins.Serialized -> Maybe a
@@ -155,7 +165,19 @@ moduleAnnotations summary = do
 
 
 loadValue :: Introspection -> Ghc Value
-loadValue (Show name) = do
+loadValue (Show name) = showValue name
+loadValue (Run name) = runValue name
+
+mkErrorValue :: GHC.DynFlags -> Maybe GHC.Type -> String -> HSC.SourceError -> Value
+mkErrorValue dynFlags typ nameString err =
+  Value
+    { valueType = maybe "??" (Out.showPpr dynFlags) typ
+    , valueName = nameString
+    , valueEval = Left (show err)
+    }
+
+showValue :: OccName.OccName -> Ghc Value
+showValue name = do
   dynFlags <- GHC.getSessionDynFlags
 
   let nameString = Out.showPpr dynFlags name
@@ -163,33 +185,77 @@ loadValue (Show name) = do
   typResult <- gtry (GHC.exprType GHC.TM_Inst nameString)
 
   case typResult of
-    Left (err :: HSC.SourceError) ->
-      pure $ Value
-        { valueType = "??"
-        , valueName = nameString
-        , valueEval = show err
-        }
+    Left err ->
+      pure $ mkErrorValue dynFlags Nothing nameString err
 
     Right typ -> do
       -- It would be nice to use HsSyn (or similar) to construct this expression
       -- in a way guaranteed to parse, but for now we take this shortcut.
-      result <- gtry (GHC.dynCompileExpr ("FWPL_QXJIT_PRELUDE.show " ++ nameString))
+      result <- gtry (GHC.dynCompileExpr (help_show ++ " " ++ nameString))
 
       pure $
         case result of
-          Left (err :: HSC.SourceError) ->
-            Value
-              { valueType = Out.showPpr dynFlags typ
-              , valueName = nameString
-              , valueEval = show err
-              }
+          Left err ->
+            mkErrorValue dynFlags (Just typ) nameString err
 
           Right dyn ->
             Value
               { valueType = Out.showPpr dynFlags typ
               , valueName = nameString
-              , valueEval = Dynamic.fromDyn dyn "<FWPL INTERNAL ERROR: Show result was not a String>"
+              , valueEval =
+                Right $
+                  Eval
+                    { evalResult = Dynamic.fromDyn dyn "<FWPL INTERNAL ERROR: Compiled result was not a String>"
+                    , evalOutput = ""
+                    }
               }
+
+runValue :: OccName.OccName -> Ghc Value
+runValue name = do
+  dynFlags <- GHC.getSessionDynFlags
+
+  let nameString = Out.showPpr dynFlags name
+
+  typResult <- gtry (GHC.exprType GHC.TM_Inst nameString)
+
+  case typResult of
+    Left err ->
+      pure $ mkErrorValue dynFlags Nothing nameString err
+
+    Right typ -> do
+      -- All this mess is to make sure that stdout gets flushed in the
+      -- interpreted context so that Silently.capture (below) can grab
+      -- the output. I tried running flush in the local (compiled) context
+      -- here inside the capture, but stdout here refers to something
+      -- different than in the interpreted context :(
+      let expr = concat
+                  [ help_liftA2, " ", help_const
+                  , "(", help_fmap, " ", help_show, " ", nameString, ")"
+                  , " "
+                  , "(", help_hFlush, " ", help_stdout, ")"
+                  ]
+
+      compileResult <- gtry (GHC.dynCompileExpr expr)
+
+      case compileResult of
+        Left err ->
+          pure $ mkErrorValue dynFlags (Just typ) nameString err
+
+        Right dynAction -> do
+          let action = Dynamic.fromDyn dynAction (pure "<FWPL INTERNAL ERROR: Compiled result was not an IO String>")
+
+          (output, result) <- liftIO $ Silently.capture action
+
+          pure $ Value
+            { valueType = Out.showPpr dynFlags typ
+            , valueName = nameString
+            , valueEval =
+              Right $
+                Eval
+                  { evalResult = result
+                  , evalOutput = output
+                  }
+            }
 
 fileTarget :: FilePath -> GHC.Target
 fileTarget filePath =
@@ -199,9 +265,44 @@ fileTarget filePath =
     , GHC.targetContents = Nothing
     }
 
-prelude :: GHC.ImportDecl GHC.RdrName
-prelude =
-  (GHC.simpleImportDecl (GHC.mkModuleName "Prelude"))
+preludeImport :: GHC.ImportDecl GHC.RdrName
+preludeImport = fwplHelperImport "Prelude"
+
+ioImport :: GHC.ImportDecl GHC.RdrName
+ioImport = fwplHelperImport "System.IO"
+
+applicativeImport :: GHC.ImportDecl GHC.RdrName
+applicativeImport = fwplHelperImport "Control.Applicative"
+
+fwplHelperImport :: String -> GHC.ImportDecl GHC.RdrName
+fwplHelperImport moduleName =
+  (GHC.simpleImportDecl (GHC.mkModuleName moduleName))
     { GHC.ideclQualified = True
-    , GHC.ideclAs = Just (GHC.noLoc (GHC.mkModuleName "FWPL_QXJIT_PRELUDE"))
+    , GHC.ideclAs = Just (GHC.noLoc (GHC.mkModuleName (fwplHelperAlias moduleName)))
     }
+
+fwplHelperAlias :: String -> String
+fwplHelperAlias originalName =
+  "FWPL_QXJIT_" ++ map underscoreize originalName
+    where
+      underscoreize '.' = '_'
+      underscoreize c = c
+
+fwplHelper :: String -> String -> String
+fwplHelper moduleName functionName =
+  fwplHelperAlias moduleName ++ "." ++ functionName
+
+--
+-- Helpers function names using FWPL_QXJIT_ qualified imports to avoid any
+-- strange effects from these names not corresponding to the function we
+-- expect. If someone imports modules into their scope qualified by
+-- FWPL_QXJIT_, well that's on them...
+--
+help_show, help_fmap, help_const, help_liftA2, help_hFlush, help_stdout :: String
+help_show = fwplHelper "Prelude" "show"
+help_fmap = fwplHelper "Prelude" "fmap"
+help_const = fwplHelper "Prelude" "const"
+help_liftA2 = fwplHelper "Control.Applicative" "liftA2"
+help_hFlush = fwplHelper "System.IO" "hFlush"
+help_stdout = fwplHelper "System.IO" "stdout"
+

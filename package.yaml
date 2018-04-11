@@ -26,6 +26,7 @@ dependencies:
 - ghc
 - ghc-paths
 - exceptions
+- silently
 - vty
 
 library:
